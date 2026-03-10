@@ -156,11 +156,41 @@ def read_note(filename: str, search_keyword: str = None) -> str:
 def search_vault(query: str) -> str:
     """Search the vault for filenames containing the query. Returns a list of matching file paths."""
     print(f"\n[Research Tool] 🔍 Searching vault for: '{query}'...")
+    
+    def _do_search(q, limit=10):
+        try:
+            result = subprocess.run(["obsidian", "search", f"query={q}", "format=text", f"limit={limit}"], capture_output=True, text=True, check=True)
+            output = result.stdout.strip()
+            if "No matches found." in output:
+                return ""
+            return re.sub(r"2026-.*?https://obsidian\.md/download\n*", "", output, flags=re.DOTALL).strip()
+        except Exception:
+            return ""
+
     try:
-        result = subprocess.run(["obsidian", "search", f"query={query}", "format=text", "limit=5"], capture_output=True, text=True, check=True)
-        output = result.stdout.strip()
-        output = re.sub(r"2026-.*?https://obsidian\.md/download\n*", "", output, flags=re.DOTALL).strip()
-        return output if output else "No results found."
+        output = _do_search(query, 10)
+        if output:
+            return output
+        
+        # Fallback: split query if it has multiple words
+        queries = [w.strip() for w in query.split() if len(w.strip()) > 2]
+        if len(queries) <= 1:
+            return "No results found. Try a different, maybe less specific search query."
+            
+        if DEBUG_MODE:
+            print(f"No results for full query. Splitting into words: {queries[:5]}")
+            
+        results = []
+        for q in queries[:5]:
+            ans = _do_search(q, 5)
+            if ans:
+                results.append(f"--- Results for '{q}' ---\n{ans}")
+                
+        if results:
+            return "\n\n".join(results)
+        
+        return "No results found. Try a different, maybe less specific search query."
+
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -261,7 +291,11 @@ def process_reasoning_output(response: AIMessage, name: str, tool_map: dict) -> 
             for item in parsed:
                 item_keys = set(item.keys())
                 for tool_name, tool_obj in tool_map.items():
-                    expected_keys = set(tool_obj.args_schema.schema()["properties"].keys()) if tool_obj.args_schema else set()
+                    try:
+                        expected_keys = set(tool_obj.args_schema.model_json_schema()["properties"].keys()) if tool_obj.args_schema else set()
+                    except AttributeError:
+                        expected_keys = set(tool_obj.args_schema.schema()["properties"].keys()) if tool_obj.args_schema else set()
+                    
                     if expected_keys and expected_keys.issubset(item_keys):
                         print(f"[System] 🔧 Rescued tool call '{tool_name}' from raw JSON!")
                         response.tool_calls.append({"name": tool_name, "args": item, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
@@ -282,21 +316,21 @@ def process_reasoning_output(response: AIMessage, name: str, tool_map: dict) -> 
         if name == "Manager":
             response.tool_calls.append({
                 "name": "respond_to_user",
-                "args": {"response": err_msg},
+                "args": {"final_answer": err_msg},
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "tool_call"
             })
         elif name == "Researcher":
             response.tool_calls.append({
                 "name": "submit_findings",
-                "args": {"findings": err_msg},
+                "args": {"summary": err_msg, "sources": []},
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "tool_call"
             })
         elif name == "Writer":
             response.tool_calls.append({
                 "name": "finish_writing",
-                "args": {"summary": err_msg},
+                "args": {"confirmation": err_msg},
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "tool_call"
             })
@@ -389,8 +423,15 @@ def tool_executor(state: AgentState):
             continue
         # ------------------------------------
 
-        result     = all_tools_map[tool_name].invoke(tool_args)
-        str_result = str(result)
+        try:
+            result     = all_tools_map[tool_name].invoke(tool_args)
+            str_result = str(result)
+        except Exception as e:
+            err_str = str(e)
+            print(f"\n⚠️ [System] Tool execution failed for {tool_name} (Bad args from LLM?): {err_str[:200]}...")
+            error_msg = f"SYSTEM ERROR: Tool '{tool_name}' execution failed due to invalid arguments. Ensure you are providing the EXACT arguments specified in the tool documentation. Error details: {err_str}"
+            outs.append(ToolMessage(content=error_msg, tool_call_id=tc["id"], name=tool_name))
+            continue
 
         # Resolve the response length cap from the receiving agent's LLM profile
         caller    = tool_to_agent.get(tool_name, "manager")
