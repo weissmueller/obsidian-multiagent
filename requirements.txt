@@ -1,6 +1,6 @@
 langchain-core
 langchain-community
-langchain-ollama
+langchain-openai
 langgraph
 litellm
 requests
