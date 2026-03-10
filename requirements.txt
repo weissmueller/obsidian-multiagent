@@ -1,0 +1,8 @@
+langchain-core
+langchain-community
+langchain-ollama
+langgraph
+litellm
+requests
+urllib3
+pyyaml
