@@ -20,6 +20,8 @@ from langgraph.checkpoint.memory import MemorySaver
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.NotOpenSSLWarning)
 
+TOTAL_SESSION_COST = 0.0
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -91,19 +93,21 @@ writer_llm     = make_llm(cfg["agents"]["writer"]["llm"])
 @tool
 def create_note(title: str, content: str) -> str:
     """Create a new note in the Obsidian vault."""
-    print(f"\n[Writer Tool] ⚡ Executing CLI to create: '{title}'...")
+    safe_title = re.sub(r'[\\/*?:"<>|]', '-', title)
+    print(f"\n[Writer Tool] ⚡ Executing CLI to create: '{safe_title}'...")
     try:
-        subprocess.run(["obsidian", "create", f"name={title}", f"content={content}"], capture_output=True, text=True, check=True)
-        return f"Success: Note saved exactly as '{title}'."
+        subprocess.run(["obsidian", "create", f"name={safe_title}", f"content={content}"], capture_output=True, text=True, check=True)
+        return f"Success: Note saved exactly as '{safe_title}'."
     except Exception as e:
         return f"Error: {str(e)}"
 
 @tool
 def append_note(filename: str, content: str) -> str:
     """Append text content to an existing note."""
+    safe_filename = re.sub(r'[\\/*?:"<>|]', '-', filename)
     try:
-        subprocess.run(["obsidian", "append", f"file={filename}", f"content={content}"], capture_output=True, text=True, check=True)
-        return f"Success: Appended content to '{filename}'."
+        subprocess.run(["obsidian", "append", f"file={safe_filename}", f"content={content}"], capture_output=True, text=True, check=True)
+        return f"Success: Appended content to '{safe_filename}'."
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -170,9 +174,12 @@ def delegate_to_researcher(task: str) -> str:
     return f"System: Task delegated to Researcher -> {task}"
 
 @tool
-def delegate_to_writer(task: str) -> str:
-    """Assign a saving/writing task to the Writer agent."""
-    return f"System: Task delegated to Writer -> {task}"
+def delegate_to_writer(task: str, sources: list[str]) -> str:
+    """Assign a saving/writing task to the Writer agent. Provide the task description and a list of sources that must be cited."""
+    # Extract just the filename (no path, no .md) for clean Obsidian links
+    cleaned = [s.split('/')[-1][:-3] if s.lower().endswith(".md") else s.split('/')[-1] for s in sources]
+    src_str = ", ".join(cleaned) if cleaned else "None provided"
+    return f"System: Task delegated to Writer -> {task}\nSources to cite: {src_str}"
 
 @tool
 def respond_to_user(final_answer: str) -> str:
@@ -180,9 +187,12 @@ def respond_to_user(final_answer: str) -> str:
     return final_answer
 
 @tool
-def submit_findings(summary: str) -> str:
-    """Submit the final research findings back to the Manager."""
-    return f"Researcher Findings: {summary}"
+def submit_findings(summary: str, sources: list[str]) -> str:
+    """Submit the final research findings back to the Manager. Must include a list of filenames used as sources."""
+    # Extract just the filename (no path, no .md) for clean Obsidian links
+    cleaned = [s.split('/')[-1][:-3] if s.lower().endswith(".md") else s.split('/')[-1] for s in sources]
+    src_str = ", ".join(cleaned) if cleaned else "None provided"
+    return f"Researcher Findings: {summary}\nSources found: {src_str}"
 
 @tool
 def finish_writing(confirmation: str) -> str:
@@ -229,9 +239,18 @@ def process_reasoning_output(response: AIMessage, name: str, tool_map: dict) -> 
         in_tokens  = usage.get("input_tokens", 0)
         out_tokens = usage.get("output_tokens", 0)
         try:
+            # Let LiteLLM calculate the cost based on its internal pricing database
+            # This handles both input and output tokens for the specified model
             cost = litellm.completion_cost(model=clean_model, prompt_tokens=in_tokens, completion_tokens=out_tokens)
-            print(f"💰 [Cost Tracker] {name} used {in_tokens} prompt tokens, {out_tokens} completion tokens. Est. Cost: ${cost:.6f}")
+            
+            global TOTAL_SESSION_COST
+            TOTAL_SESSION_COST += cost
+            
+            print(f"💰 [Cost Tracker] {name} using {clean_model}: "
+                  f"{in_tokens} in, {out_tokens} out tokens. "
+                  f"Cost: ${cost:.6f} | Session Total: ${TOTAL_SESSION_COST:.6f}")
         except Exception:
+            # If model is unmapped (like local qwen3), cost returns 0 or fails gracefully
             pass
 
     # JSON Catcher — rescue bare JSON tool calls from models that don't format properly
@@ -251,9 +270,38 @@ def process_reasoning_output(response: AIMessage, name: str, tool_map: dict) -> 
         except json.JSONDecodeError:
             pass
 
-    if not response.tool_calls and not response.content.strip():
-        print(f"⚠️ [System] {name} provided empty output. Forcing retry.")
-        response.content = "SYSTEM ERROR: You must output a valid tool call."
+    if not response.tool_calls:
+        if not response.content.strip():
+            print(f"⚠️ [System] {name} provided empty output. Forcing a fallback tool call.")
+            err_msg = "SYSTEM ERROR: You must output a valid tool call."
+        else:
+            err_msg = response.content
+
+        print(f"⚠️ [System] {name} failed to output a tool call (or hit an API error). Wrapping plain text to prevent looping.")
+        
+        if name == "Manager":
+            response.tool_calls.append({
+                "name": "respond_to_user",
+                "args": {"response": err_msg},
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "tool_call"
+            })
+        elif name == "Researcher":
+            response.tool_calls.append({
+                "name": "submit_findings",
+                "args": {"findings": err_msg},
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "tool_call"
+            })
+        elif name == "Writer":
+            response.tool_calls.append({
+                "name": "finish_writing",
+                "args": {"summary": err_msg},
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "tool_call"
+            })
+        
+        response.content = ""
 
     return response
 
@@ -264,10 +312,12 @@ def safe_invoke(llm_bound, msgs, name, tool_map):
         return process_reasoning_output(response, name, tool_map)
     except IndexError:
         print(f"\n🛡️ [System Shield] Caught API Empty Response Error (Safety Filter/Parse Failure). Forcing fallback.")
-        return AIMessage(content="SYSTEM ERROR: The underlying AI model refused to process the prompt (likely due to a safety filter or parsing bug). Please summarize what you know so far using `submit_findings` or `respond_to_user`.")
+        err_msg = "SYSTEM ERROR: The underlying AI model refused to process the prompt (likely due to a safety filter or parsing bug)."
+        return process_reasoning_output(AIMessage(content=err_msg), name, tool_map)
     except Exception as e:
-        print(f"\n🛡️ [System Shield] Caught API Exception: {str(e)}. Forcing fallback.")
-        return AIMessage(content=f"SYSTEM ERROR: The API call failed with error: {str(e)}. Please try a different approach.")
+        print(f"\n🛡️ [System Shield] Caught API Exception: {str(e)[:200]}... Forcing fallback.")
+        err_msg = f"SYSTEM ERROR: The API call failed with error: {str(e)}"
+        return process_reasoning_output(AIMessage(content=err_msg), name, tool_map)
 
 # ---------------------------------------------------------------------------
 # Nodes

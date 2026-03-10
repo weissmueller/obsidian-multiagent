@@ -1,0 +1,1 @@
+- sources / citations don't need the full path of the note, since every note has a exclusive filename, we can just refer to the filename
