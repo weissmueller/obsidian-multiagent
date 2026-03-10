@@ -268,20 +268,20 @@ def process_reasoning_output(response: AIMessage, name: str, tool_map: dict) -> 
     if usage:
         in_tokens  = usage.get("input_tokens", 0)
         out_tokens = usage.get("output_tokens", 0)
+        cost = 0.0
         try:
             # Let LiteLLM calculate the cost based on its internal pricing database
-            # This handles both input and output tokens for the specified model
             cost = litellm.completion_cost(model=clean_model, prompt_tokens=in_tokens, completion_tokens=out_tokens)
-            
-            global TOTAL_SESSION_COST
-            TOTAL_SESSION_COST += cost
-            
-            print(f"💰 [Cost Tracker] {name} using {clean_model}: "
-                  f"{in_tokens} in, {out_tokens} out tokens. "
-                  f"Cost: ${cost:.6f} | Session Total: ${TOTAL_SESSION_COST:.6f}")
         except Exception:
             # If model is unmapped (like local qwen3), cost returns 0 or fails gracefully
             pass
+
+        global TOTAL_SESSION_COST
+        TOTAL_SESSION_COST += cost
+        
+        print(f"💰 [Cost Tracker] {name} using {clean_model}: "
+              f"{in_tokens} in, {out_tokens} out tokens. "
+              f"Cost: ${cost:.6f} | Session Total: ${TOTAL_SESSION_COST:.6f}")
 
     # JSON Catcher — rescue bare JSON tool calls from models that don't format properly
     if not response.tool_calls and (cleaned_content.startswith("{") or cleaned_content.startswith("[")):
