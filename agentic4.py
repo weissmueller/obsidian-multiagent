@@ -1,0 +1,702 @@
+import os
+import subprocess
+import sys
+import requests
+import operator
+import re
+import json
+import uuid
+import yaml
+from datetime import datetime
+from typing import Annotated, Sequence, TypedDict, Literal
+from pathlib import Path
+
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+import litellm
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.NotOpenSSLWarning)
+
+TOTAL_SESSION_COST = 0.0
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_config(path: str = "config.yaml") -> dict:
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file '{path}' not found. "
+            "Please create it based on the config.yaml template."
+        )
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+cfg     = load_config()
+prompts = load_config("prompts.yaml")
+
+# System-level constants
+DEBUG_MODE = cfg["system"]["debug_mode"]
+EXPORT_HTML = cfg["system"].get("export_html", False)
+
+# LiteLLM connection
+LITELLM_URL      = cfg["litellm"]["base_url"]
+LITELLM_AUTH_KEY = cfg["litellm"]["api_key"]
+
+# ---------------------------------------------------------------------------
+# LLM factory + per-agent profile helpers
+# ---------------------------------------------------------------------------
+
+def get_profile(profile_name: str) -> dict:
+    """Return the raw profile dict for a named LLM profile."""
+    profiles = cfg.get("llm_profiles", {})
+    if profile_name not in profiles:
+        raise ValueError(
+            f"LLM profile '{profile_name}' not found in config.yaml. "
+            f"Available profiles: {list(profiles.keys())}"
+        )
+    return profiles[profile_name]
+
+_agent_profiles = {
+    agent: get_profile(agent_cfg["llm"])
+    for agent, agent_cfg in cfg.get("agents", {}).items()
+}
+
+def agent_limit(agent_name: str, key: str, default):
+    return _agent_profiles.get(agent_name, {}).get(key, default)
+
+def make_llm(profile_name: str) -> ChatOpenAI:
+    profile = get_profile(profile_name)
+    return ChatOpenAI(
+        model       = profile["model"],
+        temperature = profile.get("temperature", 0),
+        max_tokens  = profile.get("max_tokens", None),
+        base_url    = LITELLM_URL,
+        api_key     = LITELLM_AUTH_KEY,
+    )
+
+manager_llm    = make_llm(cfg["agents"]["manager"]["llm"])
+researcher_llm = make_llm(cfg["agents"]["researcher"]["llm"])
+writer_llm     = make_llm(cfg["agents"]["writer"]["llm"])
+summariser_llm = make_llm(cfg["agents"]["summariser"]["llm"])
+
+# ---------------------------------------------------------------------------
+# Worker Tools (Vault Actions)
+# ---------------------------------------------------------------------------
+
+@tool
+def create_note(title: str, content: str) -> str:
+    """Create a new note in the Obsidian vault."""
+    safe_title = re.sub(r'[\\/*?:"<>|]', '-', title)
+    print(f"\n[Writer Tool] ⚡ Executing CLI to create: '{safe_title}'...")
+    try:
+        subprocess.run(["obsidian", "create", f"name={safe_title}", f"content={content}"], capture_output=True, text=True, check=True)
+        return f"Success: Note saved exactly as '{safe_title}'."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@tool
+def append_note(filename: str, content: str) -> str:
+    """Append text content to an existing note."""
+    safe_filename = re.sub(r'[\\/*?:"<>|]', '-', filename)
+    try:
+        subprocess.run(["obsidian", "append", f"file={safe_filename}", f"content={content}"], capture_output=True, text=True, check=True)
+        return f"Success: Appended content to '{safe_filename}'."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@tool
+def read_note(filename: str, search_keywords: list[str] = None) -> str:
+    """Read a specific note. Optional: provide a list of 'search_keywords' to extract relevant snippets from very long notes."""
+    print(f"\n[Summariser Tool] 🔍 Reading note: '{filename}'" + (f" (Keywords: {search_keywords})" if search_keywords else "") + "...")
+    try:
+        result  = subprocess.run(["obsidian", "read", f"file={filename}"], capture_output=True, text=True, check=True)
+        content = result.stdout.strip()
+
+        max_len = agent_limit("summariser", "max_tool_response_length", 20000)
+        buf     = agent_limit("summariser", "read_note_buffer_size", 5000)
+
+        if len(content) <= max_len:
+            return content
+
+        if search_keywords:
+            # Fix common LLM hallucination where it passes a single string instead of a list
+            if isinstance(search_keywords, str):
+                search_keywords = [search_keywords]
+
+            snippets = []
+            for kw in search_keywords:
+                matches = [m.start() for m in re.finditer(re.escape(kw), content, re.IGNORECASE)]
+                
+                # Extract up to 3 snippets per keyword
+                for match_idx in matches[:3]:
+                    start = max(0, match_idx - buf)
+                    end   = min(len(content), match_idx + len(kw) + buf)
+                    snippets.append(f"...{content[start:end]}...")
+
+            if not snippets:
+                return (f"SYSTEM WARNING: The file '{filename}' is {len(content)} characters long, "
+                        f"but none of the keywords {search_keywords} were found. "
+                        f"Here is the beginning of the file:\n\n{content[:3000]}...")
+
+            extracted_text  = f"*** EXTRACTED SNIPPETS FOR {search_keywords} IN '{filename}' (File too large to load entirely) ***\n\n"
+            extracted_text += "\n\n[... SNIPPET BREAK ...]\n\n".join(snippets)
+            return extracted_text
+
+        else:
+            return (content[:max_len] +
+                    "\n\n[... TEXT TRUNCATED BY SYSTEM ...]\n" +
+                    f"ACTION REQUIRED: This note is {len(content)} characters long and exceeds the {max_len} limit. " +
+                    "To read deeper into this file, you MUST call `read_note` again and provide specific `search_keywords`.")
+
+    except Exception as e:
+        return f"Error reading note: {str(e)}"
+
+@tool
+def search_vault(query: str) -> str:
+    """Search the vault for filenames containing the query. Returns a list of matching file paths."""
+    print(f"\n[Research Tool] 🔍 Searching vault for: '{query}'...")
+    
+    def _do_search(q, limit=10):
+        try:
+            result = subprocess.run(["obsidian", "search", f"query={q}", "format=text", f"limit={limit}"], capture_output=True, text=True, check=True)
+            output = result.stdout.strip()
+            if "No matches found." in output:
+                return ""
+            return re.sub(r"2026-.*?https://obsidian\.md/download\n*", "", output, flags=re.DOTALL).strip()
+        except Exception:
+            return ""
+
+    try:
+        output = _do_search(query, 10)
+        if output:
+            return output
+        
+        queries = [w.strip() for w in query.split() if len(w.strip()) > 2]
+        if len(queries) <= 1:
+            return "No results found. Try a different search query."
+            
+        results = []
+        for q in queries[:5]:
+            ans = _do_search(q, 5)
+            if ans:
+                results.append(f"*** Results for '{q}' ***\n{ans}")
+                
+        if results:
+            return "\n\n".join(results)
+        
+        return "No results found. Try a different search query."
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# Communication & Planning Tools
+# ---------------------------------------------------------------------------
+
+@tool
+def update_plan(plan_details: str) -> str:
+    """Create or update your step-by-step plan to track progress."""
+    return f"System: Plan successfully updated."
+
+@tool
+def ask_clarifying_question(question: str) -> str:
+    """Ask the user a clarifying question before proceeding with the plan."""
+    return question
+
+@tool
+def delegate_to_researcher(task: str) -> str:
+    """Assign a research task to the Researcher agent to look up information in the vault."""
+    return f"System: Task delegated to Researcher -> {task}"
+
+@tool
+def delegate_to_summariser(file_path: str, research_question: str) -> str:
+    """Assign a specific file to the Summariser to read and extract answers for your research question."""
+    return f"System: Task delegated to Summariser -> Read '{file_path}' for question: '{research_question}'"
+
+@tool
+def delegate_to_writer(task: str, sources: list[str]) -> str:
+    """Assign a saving/writing task to the Writer agent."""
+    cleaned = [s.split('/')[-1][:-3] if s.lower().endswith(".md") else s.split('/')[-1] for s in sources]
+    src_str = ", ".join(cleaned) if cleaned else "None provided"
+    return f"System: Task delegated to Writer -> {task}\nSources to cite: {src_str}"
+
+@tool
+def respond_to_user(final_answer: str) -> str:
+    """Respond directly to the user to conclude the conversation."""
+    return final_answer
+
+@tool
+def submit_findings(summary: str, sources: list[str]) -> str:
+    """Submit the final research findings back to the Manager."""
+    cleaned = [s.split('/')[-1][:-3] if s.lower().endswith(".md") else s.split('/')[-1] for s in sources]
+    src_str = ", ".join(cleaned) if cleaned else "None provided"
+    return f"Researcher Findings: {summary}\nSources found: {src_str}"
+
+@tool
+def submit_summary(summary: str, source: str) -> str:
+    """Submit the summary of the read note back to the Researcher."""
+    return f"Summariser Findings for '{source}':\n{summary}"
+
+@tool
+def finish_writing(confirmation: str) -> str:
+    """Confirm to the Manager that the writing task is complete."""
+    return f"Writer Confirmation: {confirmation}"
+
+manager_tools    = [delegate_to_researcher, delegate_to_writer, respond_to_user, ask_clarifying_question, update_plan]
+researcher_tools = [search_vault, delegate_to_summariser, submit_findings]
+summariser_tools = [read_note, submit_summary]
+writer_tools     = [create_note, append_note, finish_writing]
+
+# ---------------------------------------------------------------------------
+# Orchestration Helpers
+# ---------------------------------------------------------------------------
+
+class AgentState(TypedDict, total=False):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    plan: str
+
+def process_reasoning_output(response: AIMessage, name: str, tool_map: dict) -> AIMessage:
+    raw_content = response.content or ""
+    thoughts    = ""
+
+    if "reasoning_content" in response.additional_kwargs:
+        thoughts         = response.additional_kwargs["reasoning_content"]
+        cleaned_content  = raw_content
+    else:
+        thought_match   = re.search(r'<think>(.*?)</think>', raw_content, re.DOTALL)
+        if thought_match:
+            thoughts    = thought_match.group(1).strip()
+        cleaned_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+
+    response.content = cleaned_content
+
+    response.additional_kwargs["agent_name"] = name
+    if thoughts:
+        response.additional_kwargs["agent_thoughts"] = thoughts
+
+    if DEBUG_MODE and thoughts:
+        print(f"\n🧠 [DEBUG - {name} Thoughts]:\n{thoughts}")
+
+    metadata          = response.response_metadata or {}
+    actual_model      = metadata.get("model_name") or metadata.get("model", "unknown")
+    clean_model       = actual_model.replace("openai/", "").replace("openrouter/", "")
+
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        in_tokens  = usage.get("input_tokens", 0)
+        out_tokens = usage.get("output_tokens", 0)
+        cost = 0.0
+        try:
+            cost = litellm.completion_cost(model=clean_model, prompt_tokens=in_tokens, completion_tokens=out_tokens)
+        except Exception:
+            pass
+
+        global TOTAL_SESSION_COST
+        TOTAL_SESSION_COST += cost
+        
+        print(f"💰 [Cost Tracker] {name} using {clean_model}: "
+              f"{in_tokens} in, {out_tokens} out tokens. "
+              f"Cost: ${cost:.6f} | Session Total: ${TOTAL_SESSION_COST:.6f}")
+
+    if not response.tool_calls and (cleaned_content.startswith("{") or cleaned_content.startswith("[")):
+        try:
+            parsed = json.loads(cleaned_content)
+            parsed = [parsed] if isinstance(parsed, dict) else parsed
+            
+            for item in parsed:
+                if "function" in item and "name" in item["function"]:
+                    tool_name = item["function"]["name"]
+                    args_raw  = item["function"].get("arguments", {})
+                    
+                    if isinstance(args_raw, str):
+                        try:
+                            args = json.loads(args_raw)
+                        except json.JSONDecodeError:
+                            args = {}
+                    else:
+                        args = args_raw
+                        
+                    if tool_name in tool_map:
+                        print(f"[System] 🔧 Rescued tool call '{tool_name}' from nested OpenAI JSON format!")
+                        response.tool_calls.append({"name": tool_name, "args": args, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
+                        response.content = ""
+                        continue
+
+                item_keys = set(item.keys())
+                for tool_name, tool_obj in tool_map.items():
+                    try:
+                        expected_keys = set(tool_obj.args_schema.model_json_schema()["properties"].keys()) if tool_obj.args_schema else set()
+                    except AttributeError:
+                        expected_keys = set(tool_obj.args_schema.schema()["properties"].keys()) if tool_obj.args_schema else set()
+                    
+                    if expected_keys and expected_keys.issubset(item_keys):
+                        print(f"[System] 🔧 Rescued tool call '{tool_name}' from raw flat JSON!")
+                        response.tool_calls.append({"name": tool_name, "args": item, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
+                        response.content = ""
+                        break
+        except json.JSONDecodeError:
+            pass
+
+    if not response.tool_calls:
+        if not response.content.strip():
+            print(f"⚠️ [System] {name} provided empty output. Forcing a fallback tool call.")
+            err_msg = "SYSTEM ERROR: You must output a valid tool call."
+        else:
+            err_msg = response.content
+
+        print(f"⚠️ [System] {name} failed to output a tool call (or hit an API error). Wrapping plain text to prevent looping.")
+        
+        if name == "Manager":
+            response.tool_calls.append({"name": "respond_to_user", "args": {"final_answer": err_msg}, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
+        elif name == "Researcher":
+            response.tool_calls.append({"name": "submit_findings", "args": {"summary": err_msg, "sources": []}, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
+        elif name == "Summariser":
+            response.tool_calls.append({"name": "submit_summary", "args": {"summary": err_msg, "source": "unknown"}, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
+        elif name == "Writer":
+            response.tool_calls.append({"name": "finish_writing", "args": {"confirmation": err_msg}, "id": f"call_{uuid.uuid4().hex[:8]}", "type": "tool_call"})
+        
+        response.content = ""
+
+    return response
+
+def safe_invoke(llm_bound, msgs, name, tool_map):
+    try:
+        response = llm_bound.invoke(msgs)
+        return process_reasoning_output(response, name, tool_map)
+    except IndexError:
+        print(f"\n🛡️ [System Shield] Caught API Empty Response Error. Forcing fallback.")
+        return process_reasoning_output(AIMessage(content="SYSTEM ERROR: Model refused processing.", additional_kwargs={"agent_name": name}), name, tool_map)
+    except Exception as e:
+        print(f"\n🛡️ [System Shield] Caught API Exception: {str(e)[:200]}... Forcing fallback.")
+        return process_reasoning_output(AIMessage(content=f"SYSTEM ERROR: API failed: {str(e)}", additional_kwargs={"agent_name": name}), name, tool_map)
+
+# ---------------------------------------------------------------------------
+# HTML Exporter
+# ---------------------------------------------------------------------------
+
+def generate_html_trace(messages: Sequence[BaseMessage], filename: str):
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Agent Trace</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; padding: 20px; max-width: 1000px; margin: auto; background-color: #f4f4f9; color: #333; }
+            h1 { text-align: center; color: #2c3e50; }
+            .event { background: #fff; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; border-left: 5px solid #bdc3c7; }
+            .event.human { border-left-color: #3498db; }
+            .event.ai { border-left-color: #9b59b6; }
+            .event.tool { border-left-color: #e67e22; }
+            .event-header { padding: 15px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; background-color: #fafafa; font-weight: bold; }
+            .event-header:hover { background-color: #f1f1f1; }
+            .event-body { padding: 15px; display: none; border-top: 1px solid #eee; background-color: #fff; white-space: pre-wrap; word-wrap: break-word; font-family: monospace; font-size: 13px; }
+            .badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: normal; color: #fff; }
+            .badge-human { background-color: #3498db; }
+            .badge-ai { background-color: #9b59b6; }
+            .badge-tool { background-color: #e67e22; }
+            .thoughts { background-color: #f8f9fa; border-left: 3px solid #6c757d; padding: 10px; margin-bottom: 10px; font-style: italic; color: #555; }
+        </style>
+        <script>
+            function toggleBody(element) {
+                var body = element.nextElementSibling;
+                body.style.display = (body.style.display === "block") ? "none" : "block";
+            }
+        </script>
+    </head>
+    <body>
+        <h1>Agentic Swarm Trace</h1>
+        <p style="text-align:center;">Generated on: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
+    """
+
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            continue
+
+        if isinstance(msg, HumanMessage):
+            html_content += f"""
+            <div class="event human">
+                <div class="event-header" onclick="toggleBody(this)">
+                    <span>User Input</span>
+                    <span class="badge badge-human">Human</span>
+                </div>
+                <div class="event-body">{msg.content}</div>
+            </div>
+            """
+        elif isinstance(msg, AIMessage):
+            agent_name = msg.additional_kwargs.get("agent_name", "Unknown AI")
+            thoughts = msg.additional_kwargs.get("agent_thoughts", "")
+            
+            calls_str = ""
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    calls_str += f"<strong>Tool Call:</strong> {tc['name']}\n<strong>Args:</strong> {json.dumps(tc['args'], indent=2)}\n\n"
+            
+            content_str = msg.content if msg.content else "[No content, invoked tools]"
+            
+            body_content = ""
+            if thoughts:
+                 body_content += f"<div class='thoughts'><strong>Thoughts:</strong>\n{thoughts}</div>"
+            body_content += f"{content_str}\n\n{calls_str}".strip()
+
+            html_content += f"""
+            <div class="event ai">
+                <div class="event-header" onclick="toggleBody(this)">
+                    <span>Action by: {agent_name}</span>
+                    <span class="badge badge-ai">AI</span>
+                </div>
+                <div class="event-body">{body_content}</div>
+            </div>
+            """
+        elif isinstance(msg, ToolMessage):
+            html_content += f"""
+            <div class="event tool">
+                <div class="event-header" onclick="toggleBody(this)">
+                    <span>Tool Result: {msg.name}</span>
+                    <span class="badge badge-tool">Tool</span>
+                </div>
+                <div class="event-body">{msg.content}</div>
+            </div>
+            """
+
+    html_content += "</body></html>"
+    os.makedirs("conversations", exist_ok=True)
+    file_path = os.path.join("conversations", filename)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"\n📄 [System] Saved HTML trace to: {file_path}")
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+def manager_node(state: AgentState):
+    print("\n[Manager] Evaluating task...")
+    
+    # Inject the actual plan state into the system prompt
+    current_plan = state.get("plan", "No active plan.")
+    sys_content = prompts["manager"] + f"\n\n*** CURRENT PLAN STATUS ***\n{current_plan}\n***************************"
+    
+    msgs = [SystemMessage(content=sys_content)] + list(state["messages"])
+    response = safe_invoke(manager_llm.bind_tools(manager_tools), msgs, "Manager", {t.name: t for t in manager_tools})
+    return {"messages": [response]}
+
+def researcher_node(state: AgentState):
+    print("\n[Researcher] Investigating...")
+    msgs = [SystemMessage(content=prompts["researcher"])] + list(state["messages"])
+    response = safe_invoke(researcher_llm.bind_tools(researcher_tools), msgs, "Researcher", {t.name: t for t in researcher_tools})
+    return {"messages": [response]}
+
+def summariser_node(state: AgentState):
+    print("\n[Summariser] Reading and condensing source...")
+    msgs = [SystemMessage(content=prompts.get("summariser", ""))] + list(state["messages"])
+    response = safe_invoke(summariser_llm.bind_tools(summariser_tools), msgs, "Summariser", {t.name: t for t in summariser_tools})
+    return {"messages": [response]}
+
+def writer_node(state: AgentState):
+    print("\n[Writer] Writing... (Filtering context to save tokens)")
+    
+    # Define which tools are considered "noisy" intermediate steps
+    noisy_tools = [
+        "update_plan", 
+        "search_vault", 
+        "read_note", 
+        "ask_clarifying_question",
+        "delegate_to_researcher", 
+        "delegate_to_summariser"
+    ]
+    
+    filtered_msgs = []
+    
+    for msg in state["messages"]:
+        # 1. Drop the actual tool output if it's from a noisy tool
+        if isinstance(msg, ToolMessage) and msg.name in noisy_tools:
+            continue
+            
+        # 2. Drop the AI message that triggered the noisy tool
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            # Check if all tool calls in this specific AI message are in the noisy list
+            all_noisy = all(tc["name"] in noisy_tools for tc in msg.tool_calls)
+            if all_noisy:
+                continue
+        
+        # Keep everything else (User input, submit_findings, submit_summary, delegate_to_writer)
+        filtered_msgs.append(msg)
+        
+    msgs = [SystemMessage(content=prompts["writer"])] + filtered_msgs
+    
+    if DEBUG_MODE:
+        print(f"   -> Reduced context from {len(state['messages'])} to {len(filtered_msgs)} messages.")
+        
+    response = safe_invoke(writer_llm.bind_tools(writer_tools), msgs, "Writer", {t.name: t for t in writer_tools})
+    return {"messages": [response]}
+
+# ---------------------------------------------------------------------------
+# Shared Tool Executor
+# ---------------------------------------------------------------------------
+
+def tool_executor(state: AgentState):
+    last_msg = state["messages"][-1]
+
+    if not hasattr(last_msg, "tool_calls") or not last_msg.tool_calls:
+        return {"messages": []}
+
+    all_tools_map = {t.name: t for t in manager_tools + researcher_tools + summariser_tools + writer_tools}
+    tool_to_agent = (
+        {t.name: "manager"    for t in manager_tools} |
+        {t.name: "researcher" for t in researcher_tools} |
+        {t.name: "summariser" for t in summariser_tools} |
+        {t.name: "writer"     for t in writer_tools}
+    )
+
+    outs = []
+    plan_update = None
+
+    ai_msgs     = [m for m in state["messages"] if isinstance(m, AIMessage)]
+    prev_ai_msg = ai_msgs[-2] if len(ai_msgs) >= 2 else None
+
+    for tc in last_msg.tool_calls:
+        tool_name = tc["name"]
+        tool_args = tc["args"]
+
+        # Catch plan updates to save into state later
+        if tool_name == "update_plan":
+            plan_update = tool_args.get("plan_details", "")
+
+        is_duplicate = False
+        if prev_ai_msg and hasattr(prev_ai_msg, 'tool_calls') and prev_ai_msg.tool_calls:
+            for prev_tc in prev_ai_msg.tool_calls:
+                if prev_tc["name"] == tool_name and str(prev_tc["args"]).strip() == str(tool_args).strip():
+                    is_duplicate = True
+                    break
+
+        if is_duplicate:
+            print(f"\n🛑 [System Anti-Loop] Blocked repeated identical call: {tool_name}({tool_args})")
+            error_msg = ("SYSTEM ERROR: Loop detected! You just executed a tool with identical arguments. "
+                         "Take a DIFFERENT action.")
+            outs.append(ToolMessage(content=error_msg, tool_call_id=tc["id"], name=tool_name))
+            continue
+
+        try:
+            result     = all_tools_map[tool_name].invoke(tool_args)
+            str_result = str(result)
+        except Exception as e:
+            print(f"\n⚠️ [System] Tool execution failed for {tool_name}: {str(e)[:200]}...")
+            outs.append(ToolMessage(content=f"SYSTEM ERROR: Invalid arguments. Details: {str(e)}", tool_call_id=tc["id"], name=tool_name))
+            continue
+
+        caller  = tool_to_agent.get(tool_name, "manager")
+        max_len = agent_limit(caller, "max_tool_response_length", 20000)
+
+        if len(str_result) > max_len:
+            if tool_name == "search_vault":
+                final_content = str_result[:max_len] + "\n\n[... TRUNCATED ...]\nACTION REQUIRED: Use `read_note`."
+            else:
+                final_content = str_result[:max_len] + "\n\n[... TRUNCATED BY SAFETY VALVE ...]"
+        else:
+            final_content = str_result
+
+        outs.append(ToolMessage(content=final_content, tool_call_id=tc["id"], name=tool_name))
+
+    # Return messages AND the updated plan if it was modified
+    result_state = {"messages": outs}
+    if plan_update is not None:
+        result_state["plan"] = plan_update
+        
+    return result_state
+
+# ---------------------------------------------------------------------------
+# Router Logic
+# ---------------------------------------------------------------------------
+
+def route_from_node(state: AgentState):
+    if state["messages"][-1].tool_calls:
+        return "tools"
+    return "manager"
+
+def route_after_tools(state: AgentState):
+    last_msg  = state["messages"][-1]
+    tool_name = getattr(last_msg, "name", "")
+
+    routes = {
+        "delegate_to_researcher":  "researcher",
+        "delegate_to_writer":      "writer",
+        "delegate_to_summariser":  "summariser",
+        "respond_to_user":         END,
+        "ask_clarifying_question": END,
+        "update_plan":             "manager",
+        "submit_findings":         "manager",
+        "submit_summary":          "researcher",
+        "finish_writing":          "manager",
+        "search_vault":            "researcher",
+        "read_note":               "summariser",
+        "create_note":             "writer",
+        "append_note":             "writer",
+    }
+    return routes.get(tool_name, "manager")
+
+# ---------------------------------------------------------------------------
+# Graph Construction
+# ---------------------------------------------------------------------------
+
+workflow = StateGraph(AgentState)
+workflow.add_node("manager",    manager_node)
+workflow.add_node("researcher", researcher_node)
+workflow.add_node("summariser", summariser_node)
+workflow.add_node("writer",     writer_node)
+workflow.add_node("tools",      tool_executor)
+
+workflow.add_edge(START, "manager")
+workflow.add_conditional_edges("manager",    route_from_node)
+workflow.add_conditional_edges("researcher", route_from_node)
+workflow.add_conditional_edges("summariser", route_from_node)
+workflow.add_conditional_edges("writer",     route_from_node)
+workflow.add_conditional_edges("tools",      route_after_tools)
+
+app = workflow.compile(checkpointer=MemorySaver())
+
+# ---------------------------------------------------------------------------
+# Chat Loop
+# ---------------------------------------------------------------------------
+
+def chat_loop():
+    agent_cfg = cfg.get("agents", {})
+    profiles  = cfg.get("llm_profiles", {})
+    banner_parts = [
+        f"Manager: {profiles[agent_cfg['manager']['llm']]['model']}",
+        f"Researcher: {profiles[agent_cfg['researcher']['llm']]['model']}",
+        f"Summariser: {profiles[agent_cfg['summariser']['llm']]['model']}",
+        f"Writer: {profiles[agent_cfg['writer']['llm']]['model']}",
+    ]
+    print(f"\nTool-Driven Swarm Ready | {' | '.join(banner_parts)} | via LiteLLM Proxy")
+
+    config = {"configurable": {"thread_id": "obsidian_manager_v4"}, "recursion_limit": 50}
+    while True:
+        user_input = input("\nYou: ")
+        if user_input.lower() in ['quit', 'exit']:
+            break
+
+        result   = app.invoke({"messages": [HumanMessage(content=user_input)]}, config)
+        last_msg = result["messages"][-1]
+        
+        if EXPORT_HTML:
+            filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+            generate_html_trace(result["messages"], filename)
+
+        tool_triggered = getattr(last_msg, "name", "")
+        if tool_triggered == "respond_to_user":
+            print(f"\nAI: {last_msg.content}")
+        elif tool_triggered == "ask_clarifying_question":
+            print(f"\nAI (Clarification Needed): {last_msg.content}")
+        else:
+            print(f"\nAI: [Workflow ended without final response]")
+
+if __name__ == "__main__":
+    chat_loop()
